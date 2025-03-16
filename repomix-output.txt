@@ -1,0 +1,852 @@
+This file is a merged representation of the entire codebase, combined into a single document by Repomix.
+
+================================================================
+File Summary
+================================================================
+
+Purpose:
+--------
+This file contains a packed representation of the entire repository's contents.
+It is designed to be easily consumable by AI systems for analysis, code review,
+or other automated processes.
+
+File Format:
+------------
+The content is organized as follows:
+1. This summary section
+2. Repository information
+3. Directory structure
+4. Multiple file entries, each consisting of:
+  a. A separator line (================)
+  b. The file path (File: path/to/file)
+  c. Another separator line
+  d. The full contents of the file
+  e. A blank line
+
+Usage Guidelines:
+-----------------
+- This file should be treated as read-only. Any changes should be made to the
+  original repository files, not this packed version.
+- When processing this file, use the file path to distinguish
+  between different files in the repository.
+- Be aware that this file may contain sensitive information. Handle it with
+  the same level of security as you would the original repository.
+
+Notes:
+------
+- Some files may have been excluded based on .gitignore rules and Repomix's configuration
+- Binary files are not included in this packed representation. Please refer to the Repository Structure section for a complete list of file paths, including binary files
+- Files matching patterns in .gitignore are excluded
+- Files matching default ignore patterns are excluded
+
+Additional Info:
+----------------
+
+================================================================
+Directory Structure
+================================================================
+providers/
+  index.ts
+src/
+  CeglocDriver/
+    index.ts
+.editorconfig
+.eslintignore
+.eslintrc.json
+.gitignore
+.prettierignore
+.prettierrc
+.repomixignore
+.yarnrc.yml
+instructions.md
+package.json
+README.md
+repomix.config.json
+standalone.ts
+tsconfig.json
+
+================================================================
+Files
+================================================================
+
+================
+File: providers/index.ts
+================
+import type { ApplicationContract } from '@ioc:Adonis/Core/Application'
+
+export default class CeglocDriverProvider {
+  constructor(protected app: ApplicationContract) {}
+
+  public async boot() {
+    const Ally = this.app.container.resolveBinding('Adonis/Addons/Ally')
+    const { CeglocDriver } = await import('../src/CeglocDriver')
+
+    Ally.extend('cegloc', (_, __, config, ctx) => {
+      return new CeglocDriver(ctx, config)
+    })
+  }
+}
+
+================
+File: src/CeglocDriver/index.ts
+================
+/*
+ * Cegloc (Keycloak) driver for AdonisJS/Ally
+ */
+
+import { HttpContextContract } from '@ioc:Adonis/Core/HttpContext'
+import {
+  AllyUserContract,
+  ApiRequestContract,
+  RedirectRequestContract,
+} from '@ioc:Adonis/Addons/Ally'
+import { Oauth2Driver } from '@adonisjs/ally/build/standalone'
+
+/**
+ * Shape of the Cegloc access token
+ */
+export type CeglocToken = {
+  token: string
+  type: 'bearer'
+}
+
+/**
+ * Available scopes for Cegloc
+ */
+export type CeglocScopes = 'openid' | 'profile' | 'email'
+
+/**
+ * Configuration for the Cegloc driver
+ */
+export type CeglocDriverConfig = {
+  driver: 'cegloc'
+  clientId: string
+  clientSecret: string
+  callbackUrl: string
+  baseUrl: string
+  realm: string
+  scopes?: CeglocScopes[]
+  authorizeUrl?: string
+  accessTokenUrl?: string
+  userInfoUrl?: string
+}
+
+/**
+ * Contract for Cegloc driver
+ */
+export interface CeglocDriverContract {
+  accessDenied(): boolean
+  user(callback?: (request: ApiRequestContract) => void): Promise<AllyUserContract<CeglocToken>>
+  userFromToken(
+    token: string,
+    callback?: (request: ApiRequestContract) => void
+  ): Promise<AllyUserContract<CeglocToken>>
+}
+
+/**
+ * Cegloc driver to login user via Cegloc (Keycloak)
+ */
+export class CeglocDriver
+  extends Oauth2Driver<CeglocToken, CeglocScopes>
+  implements CeglocDriverContract
+{
+  /**
+   * Default URLs
+   */
+  protected accessTokenUrl = ''
+  protected authorizeUrl = ''
+  protected userInfoUrl = ''
+
+  /**
+   * The param name for the authorization code
+   */
+  protected codeParamName = 'code'
+
+  /**
+   * The param name for the error
+   */
+  protected errorParamName = 'error'
+
+  /**
+   * Cookie name for storing the "cegloc_oauth_state"
+   */
+  protected stateCookieName = 'cegloc_oauth_state'
+
+  /**
+   * Parameter name to be used for sending and receiving the state
+   */
+  protected stateParamName = 'state'
+
+  /**
+   * Parameter name for defining the scopes
+   */
+  protected scopeParamName = 'scope'
+
+  /**
+   * Scopes separator
+   */
+  protected scopesSeparator = ' '
+
+  constructor(ctx: HttpContextContract, public config: CeglocDriverConfig) {
+    super(ctx, config)
+
+    // Set the URLs based on the config
+    this.accessTokenUrl =
+      this.config.accessTokenUrl ||
+      `${this.config.baseUrl}/realms/${this.config.realm}/protocol/openid-connect/token`
+
+    this.authorizeUrl =
+      this.config.authorizeUrl ||
+      `${this.config.baseUrl}/realms/${this.config.realm}/protocol/openid-connect/auth`
+
+    this.userInfoUrl =
+      this.config.userInfoUrl ||
+      `${this.config.baseUrl}/realms/${this.config.realm}/protocol/openid-connect/userinfo`
+
+    /**
+     * Extremely important to call the following method to clear the
+     * state set by the redirect request
+     */
+    this.loadState()
+  }
+
+  /**
+   * Configuring the redirect request with defaults
+   */
+  protected configureRedirectRequest(request: RedirectRequestContract<CeglocScopes>) {
+    /**
+     * Define user defined scopes or the default one's
+     */
+    request.scopes(this.config.scopes || ['openid', 'profile', 'email'])
+    request.param('response_type', 'code')
+    request.param('client_id', this.config.clientId)
+  }
+
+  /**
+   * Configuring the access token API request to send extra fields
+   */
+  protected configureAccessTokenRequest(request: ApiRequestContract) {
+    /**
+     * Send client_id and client_secret as request body parameters
+     */
+    request.field('client_id', this.config.clientId)
+    request.field('client_secret', this.config.clientSecret)
+    request.field('redirect_uri', this.config.callbackUrl)
+
+    /**
+     * Send state to cegloc when request is not stateless
+     */
+    if (!this.isStateless) {
+      request.field('state', this.stateCookieValue)
+    }
+  }
+
+  /**
+   * Returns the HTTP request with the authorization header set
+   */
+  protected getAuthenticatedRequest(url: string, token: string) {
+    const request = this.httpClient(url)
+    request.header('Authorization', `Bearer ${token}`)
+    request.header('Accept', 'application/json')
+    request.parseAs('json')
+    return request
+  }
+
+  /**
+   * Fetches the user info from the Cegloc API
+   */
+  protected async getUserInfo(token: string, callback?: (request: ApiRequestContract) => void) {
+    const request = this.getAuthenticatedRequest(this.userInfoUrl, token)
+    if (typeof callback === 'function') {
+      callback(request)
+    }
+
+    const body = await request.get()
+    return {
+      id: body.sub,
+      nickName: body.preferred_username,
+      name: body.name,
+      email: body.email,
+      emailVerificationState: (body.email_verified ? 'verified' : 'unverified') as
+        | 'verified'
+        | 'unverified',
+      avatarUrl: null,
+      original: body,
+      // Optional fields from the document that could be useful
+      firstName: body.given_name,
+      lastName: body.family_name,
+      locale: body.locale,
+    }
+  }
+
+  /**
+   * Find if the current error code is for access denied
+   */
+  public accessDenied(): boolean {
+    const error = this.getError()
+    if (!error) {
+      return false
+    }
+
+    return error === 'access_denied' || error === 'invalid_grant'
+  }
+
+  /**
+   * Returns details for the authorized user
+   */
+  public async user(callback?: (request: ApiRequestContract) => void) {
+    const token = await this.accessToken(callback)
+    const user = await this.getUserInfo(token.token, callback)
+
+    return {
+      ...user,
+      token: token,
+    }
+  }
+
+  /**
+   * Finds the user by the access token
+   */
+  public async userFromToken(token: string, callback?: (request: ApiRequestContract) => void) {
+    const user = await this.getUserInfo(token, callback)
+
+    return {
+      ...user,
+      token: { token, type: 'bearer' as const },
+    }
+  }
+}
+
+================
+File: .editorconfig
+================
+# http://editorconfig.org
+
+[*]
+indent_style = space
+indent_size = 2
+end_of_line = lf
+charset = utf-8
+trim_trailing_whitespace = true
+insert_final_newline = true
+
+[*.json]
+insert_final_newline = ignore
+
+[**.min.js]
+indent_style = ignore
+insert_final_newline = ignore
+
+[MakeFile]
+indent_style = space
+
+[*.md]
+trim_trailing_whitespace = false
+
+================
+File: .eslintignore
+================
+build
+
+================
+File: .eslintrc.json
+================
+{
+  "extends": [
+    "plugin:adonis/typescriptPackage",
+    "prettier"
+  ],
+  "plugins": [
+    "prettier"
+  ],
+  "rules": {
+    "prettier/prettier": [
+      "error",
+      {
+        "endOfLine": "auto"
+      }
+    ]
+  }
+}
+
+================
+File: .gitignore
+================
+node_modules
+coverage
+test/__app
+.DS_STORE
+.nyc_output
+.idea
+.vscode/
+*.sublime-project
+*.sublime-workspace
+*.log
+build
+dist
+shrinkwrap.yaml
+
+================
+File: .prettierignore
+================
+build
+docs
+config.json
+.eslintrc.json
+package.json
+*.html
+*.txt
+
+================
+File: .prettierrc
+================
+{
+  "trailingComma": "es5",
+  "semi": false,
+  "singleQuote": true,
+  "useTabs": false,
+  "quoteProps": "consistent",
+  "bracketSpacing": true,
+  "arrowParens": "always",
+  "printWidth": 100
+}
+
+================
+File: .repomixignore
+================
+# Add patterns to ignore here, one per line
+# Example:
+# *.log
+# tmp/
+
+================
+File: .yarnrc.yml
+================
+nodeLinker: node-modules
+
+================
+File: instructions.md
+================
+# AdonisJS Ally Cegloc Driver
+
+This package provides a custom Ally driver for the CEGLOC Keycloak authentication system.
+
+## Configuration
+
+First, define the mapping inside the `contracts/ally.ts` file as follows:
+
+```ts
+import { CeglocDriver, CeglocDriverConfig } from 'adonis-ally-cegloc/build/standalone'
+
+declare module '@ioc:Adonis/Addons/Ally' {
+  interface SocialProviders {
+    // ... other mappings
+    cegloc: {
+      config: CeglocDriverConfig
+      implementation: CeglocDriver
+    }
+  }
+}
+```
+
+## Environment Variables
+
+Add the following environment variables to your `.env` file:
+
+```
+CEGLOC_CLIENT_ID=your-client-id
+CEGLOC_CLIENT_SECRET=your-client-secret
+CEGLOC_BASE_URL=https://japanese.cegloc.tsukuba.ac.jp
+CEGLOC_REALM=cegloc
+CEGLOC_CALLBACK_URL=http://your-site.com/auth/cegloc/callback
+```
+
+## Configuration File
+
+Update your `config/ally.ts` file to include the Cegloc driver:
+
+```ts
+import Env from '@ioc:Adonis/Core/Env'
+import { AllyConfig } from '@ioc:Adonis/Addons/Ally'
+
+const allyConfig: AllyConfig = {
+  // other drivers...
+  
+  cegloc: {
+    driver: 'cegloc',
+    clientId: Env.get('CEGLOC_CLIENT_ID'),
+    clientSecret: Env.get('CEGLOC_CLIENT_SECRET'),
+    baseUrl: Env.get('CEGLOC_BASE_URL'),
+    realm: Env.get('CEGLOC_REALM'),
+    callbackUrl: Env.get('CEGLOC_CALLBACK_URL')
+  }
+}
+
+export default allyConfig
+```
+
+## Usage Example
+
+```ts
+import Route from '@ioc:Adonis/Core/Route'
+import AllyController from 'App/Controllers/Http/AllyController'
+
+Route.get('/auth/cegloc/redirect', 'AllyController.redirectToCegloc')
+Route.get('/auth/cegloc/callback', 'AllyController.ceglocCallback')
+```
+
+In your controller:
+
+```ts
+import type { HttpContextContract } from '@ioc:Adonis/Core/HttpContext'
+
+export default class AllyController {
+  public async redirectToCegloc({ ally }: HttpContextContract) {
+    return ally.use('cegloc').redirect()
+  }
+
+  public async ceglocCallback({ ally, auth, response }: HttpContextContract) {
+    const cegloc = ally.use('cegloc')
+    
+    /**
+     * User has denied access to their account
+     */
+    if (cegloc.accessDenied()) {
+      return 'Access was denied'
+    }
+    
+    /**
+     * Handle the case when redirect URL has an error
+     */
+    if (cegloc.hasError()) {
+      return cegloc.getError()
+    }
+    
+    const user = await cegloc.user()
+    
+    // Now you can:
+    // 1. Find or create a user in your database
+    // 2. Sign them in using auth.login() or using sessions
+    // 3. Return or redirect
+
+    return user
+  }
+}
+```
+
+================
+File: package.json
+================
+{
+  "name": "adonis-ally-cegloc",
+  "version": "1.0.0",
+  "description": "AdonisJS ally driver for CEGLOC Keycloak authentication",
+  "main": "build/providers/index.js",
+  "files": [
+    "build/src",
+    "build/providers",
+    "build/standalone.js",
+    "build/standalone.d.ts",
+    "build/instructions.md"
+  ],
+  "scripts": {
+    "clean": "del build",
+    "copyfiles": "copyfiles \"instructions.md\" build",
+    "compile": "npm run lint && npm run clean && tsc",
+    "build": "npm run compile && npm run copyfiles",
+    "prepublishOnly": "npm run build",
+    "lint": "eslint . --ext=.ts",
+    "format": "prettier --write .",
+    "version": "npm run build"
+  },
+  "keywords": [
+    "adonisjs",
+    "adonis-ally"
+  ],
+  "author": "",
+  "license": "MIT",
+  "devDependencies": {
+    "@adonisjs/ally": "^4.1.5",
+    "@adonisjs/core": "^5.9.0",
+    "@types/node": "^15.12.2",
+    "del-cli": "^3.0.1",
+    "eslint": "^7.28.0",
+    "eslint-config-prettier": "^8.3.0",
+    "eslint-plugin-adonis": "^1.3.2",
+    "eslint-plugin-prettier": "^3.4.0",
+    "prettier": "^2.3.1",
+    "typescript": "^4.3.2"
+  },
+  "peerDependencies": {
+    "@adonisjs/ally": "^4.0.0",
+    "@adonisjs/core": "^5.0.0"
+  },
+  "adonisjs": {
+    "instructionsMd": "./build/instructions.md",
+    "env": {
+      "CEGLOC_CLIENT_ID": "",
+      "CEGLOC_CLIENT_SECRET": "",
+      "CEGLOC_BASE_URL": "https://japanese.cegloc.tsukuba.ac.jp",
+      "CEGLOC_REALM": "cegloc"
+    },
+    "types": "adonis-ally-cegloc",
+    "providers": [
+      "adonis-ally-cegloc"
+    ]
+  },
+  "packageManager": "yarn@1.22.22+sha512.a6b2f7906b721bba3d67d4aff083df04dad64c399707841b7acf00f6b133b7ac24255f2652fa22ae3534329dc6180534e98d17432037ff6fd140556e2bb3137e"
+}
+
+================
+File: README.md
+================
+<!-- START doctoc generated TOC please keep comment here to allow auto update -->
+<!-- DON'T EDIT THIS SECTION, INSTEAD RE-RUN doctoc TO UPDATE -->
+
+## Table of contents
+
+- [Ally custom driver boilerplate](#ally-custom-driver-boilerplate)
+  - [Getting started](#getting-started)
+  - [How is the code structured?](#how-is-the-code-structured)
+    - [YourDriverAccessToken](#yourdriveraccesstoken)
+    - [YourDriverScopes](#yourdriverscopes)
+    - [YourDriverConfig](#yourdriverconfig)
+    - [YourDriver](#yourdriver)
+  - [Development checklist](#development-checklist)
+  - [Testing the driver](#testing-the-driver)
+  - [Release checklist](#release-checklist)
+  - [FAQ's](#faqs)
+    - [How do I define extra params during redirect?](#how-do-i-define-extra-params-during-redirect)
+    - [How do I define extra fields/params for the access token request?](#how-do-i-define-extra-fieldsparams-for-the-access-token-request)
+  - [Share with others](#share-with-others)
+
+<!-- END doctoc generated TOC please keep comment here to allow auto update -->
+
+# Ally custom driver boilerplate
+
+> A boilerplate for creating custom AdonisJS ally drivers
+
+This repo serves as a starting point to create your custom OAuth2 drivers for [AdonisJS ally](https://docs.adonisjs.com/guides/auth/social).
+
+The boilerplate is tailored to create one driver per project and publish it as a package on npm.
+
+## Getting started
+
+Following are the steps to get started.
+
+- Fork this repo and then clone it on your local machine.
+- Install all the dependencies using `npm` or `yarn` (whatever you prefer).
+- Open `package.json` file and update the package `name`, `description` and the `adonisjs` configuration block.
+
+  ```json
+  {
+    "name": "package-name",
+    "description": "",
+    "adonisjs": {
+      "types": "package-name",
+      "providers": ["package-name"]
+    }
+  }
+  ```
+
+## How is the code structured?
+
+The code for the driver is inside the `src` directory. Make sure to change the `YourDriver` directory name to the name of the driver.
+
+The driver implementation is mainly driven by the config, except the `user` and the `userFromToken` methods. Both of these methods are specific to the Oauth provider, and hence you have to implement them yourself.
+
+The `src/YourDriver/index.ts` file has the following exports.
+
+#### YourDriverAccessToken
+
+The type defines the properties that exist on the access token returned by your driver. You must read your OAuth provider documentation and list all the properties here.
+
+**Do not change the pre-defined `token` and `bearer` properties.**
+
+```ts
+export type YourDriverAccessToken = {
+  token: string
+  type: 'bearer'
+}
+```
+
+#### YourDriverScopes
+
+Define a union of driver scopes accepted by your OAuth provider. You can check out the [official implementations](https://github.com/adonisjs/ally/blob/develop/adonis-typings/ally.ts#L236-L268) to see how they are defined.
+
+#### YourDriverConfig
+
+The type defines the configuration options that your driver expects. It must specify the following mentioned properties, along with any additional properties your driver needs to be functional.
+
+```ts
+export type YourDriverConfig = {
+  driver: 'YourDriverName'
+  clientId: string
+  clientSecret: string
+  callbackUrl: string
+  authorizeUrl?: string
+  accessTokenUrl?: string
+  userInfoUrl?: string
+}
+```
+
+#### YourDriver
+
+The driver implementation is a standard TypeScript class that extends the base `Oauth2Driver` class. The base driver class enforces you to define the following instance properties.
+
+- `authorizeUrl` is the URL for the redirect request. The user is redirected to this URL to authorize the request. Check out provider docs to find this URL.
+- `accessTokenUrl` is used to exchange the authorization code for the access token. Check out provider docs to find this URL.
+- `userInfoUrl` is used to make a request for getting the user profile information
+- `codeParamName` is the query string parameter for reading the **authorization code** after redirecting the user back to the callback URL.
+- `errorParamName` is the query string parameter for finding the error after redirecting the user back to the callback URL.
+- `stateCookieName` is the cookie name for storing the CSRF token (also known as the state). Make sure the cookie name does not collide with other drivers. A safer option is to prefix your driver name to the `oauth_state` keyword.
+- `stateParamName` is the query string parameter name for setting the state during the authorization redirect.
+- `scopeParamName` is the query string parameter name for sending the scopes during the authorization redirect.
+- `scopesSeparator` is the character to use for separating multiple parameters.
+
+## Development checklist
+
+- [ ] I have renamed all `YourDriver` references to a more meaningful driver name inside the `src/YourDriver/index.ts` file.
+- [ ] I have renamed the `YourDriverProvider` inside the `providers/index.ts` file.
+- [ ] I have updated the driver name in the `Ally.extend` method call inside the `providers/index.ts` file.
+- [ ] I have defined the `authorizeUrl` class property.
+- [ ] I have defined the `accessTokenUrl` class property.
+- [ ] I have defined the `userInfoUrl` class property.
+- [ ] I have defined the `codeParamName` class property.
+- [ ] I have defined the `errorParamName` class property.
+- [ ] I have defined the `stateCookieName` class property.
+- [ ] I have defined the `stateParamName` class property.
+- [ ] I have defined the `scopeParamName` class property.
+- [ ] I have defined the `scopesSeparator` class property.
+- [ ] I have implemented the `accessDenied` class method.
+- [ ] I have implemented the `user` class method.
+- [ ] I have implemented the `userFromToken` class method.
+- [ ] I have updated the `standalone.ts` file to export the renamed driver file name.
+
+## Testing the driver
+
+You can test the driver by installing it locally inside your AdonisJS application. Following are the steps you need to perform.
+
+- Compile the TypeScript code to JavaScript using the `npm run build` script.
+- `cd` into your AdonisJS project and install the package locally using `npm i path/to/your/driver/package`.
+- Run `node ace configure <package-name>`. The configure command needs the package name and not the package path.
+- Inform typescript about your driver by defining a mapping inside the `contracts/ally.ts` file.
+
+  ```ts
+  import { YourDriverConfig, YourDriver } from 'ally-custom-driver/build/standalone'
+
+  interface SocialProviders {
+    yourDriver: {
+      config: YourDriverConfig
+      implementation: YourDriver
+    }
+  }
+  ```
+
+- Define the config inside the `config/ally.ts` file.
+- And now you can use your driver like any other inbuilt driver.
+
+## Release checklist
+
+Make sure to finish the following tasks before releasing your package.
+
+- [ ] I have renamed the `name` and `description` properties inside the `package.json` file.
+- [ ] I have renamed the `adonisjs.types` and `adonisjs.providers` properties to use the package name inside the `package.json` file.
+- [ ] I have updated the post-install instructions inside the `instructions.md` file.
+- [ ] I have updated the `adonisjs.env` property inside the `package.json` file to use the correct driver name for environment variables.
+
+## FAQ's
+
+### How do I define extra params during redirect?
+
+You can configure the redirect request by implementing the `configureRedirectRequest` method on the driver class. The method is already pre-defined and commented out.
+
+```ts
+protected configureRedirectRequest(request: RedirectRequest<YourDriverScopes>) {
+  request.param('key', 'value')
+}
+```
+
+### How do I define extra fields/params for the access token request?
+
+You can configure the access token request by implementing the `configureAccessTokenRequest` method on the driver class. The method is already pre-defined and commented out.
+
+```ts
+protected configureAccessTokenRequest(request: ApiRequest) {
+  // Request body
+  request.field('key', 'value')
+
+  // Query param
+  request.param('key', 'value')
+}
+```
+
+## Share with others
+
+Are you excited about sharing your work with others? Make sure to submit your package to the [awesome-adonisjs](https://github.com/adonisjs-community/awesome-adonisjs) repo.
+
+================
+File: repomix.config.json
+================
+{
+  "output": {
+    "filePath": "repomix-output.txt",
+    "style": "plain",
+    "parsableStyle": false,
+    "fileSummary": true,
+    "directoryStructure": true,
+    "removeComments": false,
+    "removeEmptyLines": false,
+    "compress": false,
+    "topFilesLength": 5,
+    "showLineNumbers": false,
+    "copyToClipboard": false
+  },
+  "include": [],
+  "ignore": {
+    "useGitignore": true,
+    "useDefaultPatterns": true,
+    "customPatterns": []
+  },
+  "security": {
+    "enableSecurityCheck": true
+  },
+  "tokenCount": {
+    "encoding": "o200k_base"
+  }
+}
+
+================
+File: standalone.ts
+================
+export * from './src/CeglocDriver'
+
+================
+File: tsconfig.json
+================
+{
+  "compilerOptions": {
+    "target": "es2020",
+    "module": "commonjs",
+    "lib": ["es2020"],
+    "noUnusedLocals": true,
+    "noUnusedParameters": true,
+    "removeComments": false,
+    "declaration": true,
+    "moduleResolution": "node",
+    "rootDir": "./",
+    "outDir": "./build",
+    "strictNullChecks": true,
+    "allowSyntheticDefaultImports": true,
+    "esModuleInterop": true,
+    "types": ["@types/node", "@adonisjs/core", "@adonisjs/ally"]
+  },
+  "include": ["**/*"],
+  "exclude": ["node_modules", "build"]
+}
+
+
+
+================================================================
+End of Codebase
+================================================================
