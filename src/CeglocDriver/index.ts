@@ -16,6 +16,7 @@ import { Oauth2Driver } from '@adonisjs/ally/build/standalone'
 export type CeglocToken = {
   token: string
   type: 'bearer'
+  refreshToken?: string
 }
 
 /**
@@ -222,5 +223,17 @@ export class CeglocDriver
       ...user,
       token: { token, type: 'bearer' as const },
     }
+  }
+
+  // stateMisMatchメソッドをオーバーライド
+  public stateMisMatch(): boolean {
+    // Keycloakが送信するsession_stateパラメータを確認
+    if (this.ctx.request.qs().session_state) {
+      // session_stateがある場合は正常なコールバックと判断
+      return false
+    }
+
+    // それ以外はスーパークラスの判定に任せる
+    return super.stateMisMatch()
   }
 }
